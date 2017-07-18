@@ -591,10 +591,10 @@ void DWARFContext::parseCompileUnits() {
 void DWARFContext::parseTypeUnits() {
   if (!TUs.empty())
     return;
-  for (const auto &I : getTypesSections()) {
+  forEachTypesSections([&](const DWARFSection &S) {
     TUs.emplace_back();
-    TUs.back().parse(*this, I.second);
-  }
+    TUs.back().parse(*this, S);
+  });
 }
 
 void DWARFContext::parseDWOCompileUnits() {
@@ -604,10 +604,10 @@ void DWARFContext::parseDWOCompileUnits() {
 void DWARFContext::parseDWOTypeUnits() {
   if (!DWOTUs.empty())
     return;
-  for (const auto &I : getTypesDWOSections()) {
+  forEachTypesDWOSections([&](const DWARFSection &S) {
     DWOTUs.emplace_back();
-    DWOTUs.back().parseDWO(*this, I.second);
-  }
+    DWOTUs.back().parseDWO(*this, S);
+  });
 }
 
 DWARFCompileUnit *DWARFContext::getCompileUnitForOffset(uint32_t Offset) {
@@ -940,14 +940,10 @@ DWARFContextInMemory::DWARFContextInMemory(
     StringRef Name;
     Section.getName(Name);
     // Skip BSS and Virtual sections, they aren't interesting.
-    bool IsBSS = Section.isBSS();
-    if (IsBSS)
+    if (Section.isBSS() || Section.isVirtual())
       continue;
-    bool IsVirtual = Section.isVirtual();
-    if (IsVirtual)
-      continue;
-    StringRef Data;
 
+    StringRef Data;
     section_iterator RelocatedSection = Section.getRelocatedSection();
     // Try to obtain an already relocated version of this section.
     // Else use the unrelocated section from the object file. We'll have to
@@ -968,6 +964,10 @@ DWARFContextInMemory::DWARFContextInMemory(
     Name = Name.substr(
         Name.find_first_not_of("._z")); // Skip ".", "z" and "_" prefixes.
 
+    // Map platform specific debug section names to DWARF standard section
+    // names.
+    Name = Obj.mapDebugSectionName(Name);
+
     if (StringRef *SectionData = mapSectionToMember(Name)) {
       *SectionData = Data;
       if (Name == "debug_ranges") {
@@ -981,10 +981,6 @@ DWARFContextInMemory::DWARFContextInMemory(
     } else if (Name == "debug_types.dwo") {
       TypesDWOSections[Section].Data = Data;
     }
-
-    // Map platform specific debug section names to DWARF standard section
-    // names.
-    Name = Obj.mapDebugSectionName(Name);
 
     if (RelocatedSection == Obj.section_end())
       continue;
@@ -1046,10 +1042,10 @@ DWARFContextInMemory::DWARFContextInMemory(
       object::RelocVisitor V(Obj);
       uint64_t Val = V.visit(Reloc.getType(), Reloc, SymInfoOrErr->Address);
       if (V.error()) {
-        SmallString<32> Name;
-        Reloc.getTypeName(Name);
+        SmallString<32> Type;
+        Reloc.getTypeName(Type);
         ErrorPolicy EP = HandleError(
-            createError("failed to compute relocation: " + Name + ", ",
+            createError("failed to compute relocation: " + Type + ", ",
                         errorCodeToError(object_error::parse_failed)));
         if (EP == ErrorPolicy::Halt)
           return;

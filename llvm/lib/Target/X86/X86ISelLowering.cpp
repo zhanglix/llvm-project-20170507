@@ -1335,6 +1335,13 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
       setOperationAction(ISD::CTTZ,             VT, Custom);
     }
 
+    // NonVLX sub-targets extend 128/256 vectors to use the 512 version.
+    for (auto VT : {MVT::v4i32, MVT::v8i32, MVT::v16i32, MVT::v2i64, MVT::v4i64,
+                    MVT::v8i64}) {
+      setOperationAction(ISD::ROTL,             VT, Custom);
+      setOperationAction(ISD::ROTR,             VT, Custom);
+    }
+
     // Need to promote to 64-bit even though we have 32-bit masked instructions
     // because the IR optimizers rearrange bitcasts around logic ops leaving
     // too many variations to handle if we don't promote them.
@@ -2661,7 +2668,7 @@ static bool mayTailCallThisCC(CallingConv::ID CC) {
   switch (CC) {
   // C calling conventions:
   case CallingConv::C:
-  case CallingConv::X86_64_Win64:
+  case CallingConv::Win64:
   case CallingConv::X86_64_SysV:
   // Callee pop conventions:
   case CallingConv::X86_ThisCall:
@@ -22665,10 +22672,31 @@ static SDValue LowerRotate(SDValue Op, const X86Subtarget &Subtarget,
   SDLoc DL(Op);
   SDValue R = Op.getOperand(0);
   SDValue Amt = Op.getOperand(1);
+  unsigned Opcode = Op.getOpcode();
+  unsigned EltSizeInBits = VT.getScalarSizeInBits();
+
+  if (Subtarget.hasAVX512()) {
+    // Attempt to rotate by immediate.
+    APInt UndefElts;
+    SmallVector<APInt, 16> EltBits;
+    if (getTargetConstantBitsFromNode(Amt, EltSizeInBits, UndefElts, EltBits)) {
+      if (!UndefElts && llvm::all_of(EltBits, [EltBits](APInt &V) {
+            return EltBits[0] == V;
+          })) {
+        unsigned Op = (Opcode == ISD::ROTL ? X86ISD::VROTLI : X86ISD::VROTRI);
+        uint64_t RotateAmt = EltBits[0].urem(EltSizeInBits);
+        return DAG.getNode(Op, DL, VT, R,
+                           DAG.getConstant(RotateAmt, DL, MVT::i8));
+      }
+    }
+
+    // Else, fall-back on VPROLV/VPRORV.
+    return Op;
+  }
 
   assert(VT.isVector() && "Custom lowering only for vector rotates!");
   assert(Subtarget.hasXOP() && "XOP support required for vector rotates!");
-  assert((Op.getOpcode() == ISD::ROTL) && "Only ROTL supported");
+  assert((Opcode == ISD::ROTL) && "Only ROTL supported");
 
   // XOP has 128-bit vector variable + immediate rotates.
   // +ve/-ve Amt = rotate left/right.
@@ -22683,7 +22711,7 @@ static SDValue LowerRotate(SDValue Op, const X86Subtarget &Subtarget,
   if (auto *BVAmt = dyn_cast<BuildVectorSDNode>(Amt)) {
     if (auto *RotateConst = BVAmt->getConstantSplatNode()) {
       uint64_t RotateAmt = RotateConst->getAPIntValue().getZExtValue();
-      assert(RotateAmt < VT.getScalarSizeInBits() && "Rotation out of range");
+      assert(RotateAmt < EltSizeInBits && "Rotation out of range");
       return DAG.getNode(X86ISD::VPROTI, DL, VT, R,
                          DAG.getConstant(RotateAmt, DL, MVT::i8));
     }
@@ -22850,7 +22878,7 @@ X86TargetLowering::lowerIdempotentRMWIntoFencedLoad(AtomicRMWInst *AI) const {
 
   auto Builder = IRBuilder<>(AI);
   Module *M = Builder.GetInsertBlock()->getParent()->getParent();
-  auto SynchScope = AI->getSynchScope();
+  auto SSID = AI->getSyncScopeID();
   // We must restrict the ordering to avoid generating loads with Release or
   // ReleaseAcquire orderings.
   auto Order = AtomicCmpXchgInst::getStrongestFailureOrdering(AI->getOrdering());
@@ -22872,7 +22900,7 @@ X86TargetLowering::lowerIdempotentRMWIntoFencedLoad(AtomicRMWInst *AI) const {
   // otherwise, we might be able to be more aggressive on relaxed idempotent
   // rmw. In practice, they do not look useful, so we don't try to be
   // especially clever.
-  if (SynchScope == SingleThread)
+  if (SSID == SyncScope::SingleThread)
     // FIXME: we could just insert an X86ISD::MEMBARRIER here, except we are at
     // the IR level, so we must wrap it in an intrinsic.
     return nullptr;
@@ -22891,7 +22919,7 @@ X86TargetLowering::lowerIdempotentRMWIntoFencedLoad(AtomicRMWInst *AI) const {
   // Finally we can emit the atomic load.
   LoadInst *Loaded = Builder.CreateAlignedLoad(Ptr,
           AI->getType()->getPrimitiveSizeInBits());
-  Loaded->setAtomic(Order, SynchScope);
+  Loaded->setAtomic(Order, SSID);
   AI->replaceAllUsesWith(Loaded);
   AI->eraseFromParent();
   return Loaded;
@@ -22902,13 +22930,13 @@ static SDValue LowerATOMIC_FENCE(SDValue Op, const X86Subtarget &Subtarget,
   SDLoc dl(Op);
   AtomicOrdering FenceOrdering = static_cast<AtomicOrdering>(
     cast<ConstantSDNode>(Op.getOperand(1))->getZExtValue());
-  SynchronizationScope FenceScope = static_cast<SynchronizationScope>(
+  SyncScope::ID FenceSSID = static_cast<SyncScope::ID>(
     cast<ConstantSDNode>(Op.getOperand(2))->getZExtValue());
 
   // The only fence that needs an instruction is a sequentially-consistent
   // cross-thread fence.
   if (FenceOrdering == AtomicOrdering::SequentiallyConsistent &&
-      FenceScope == CrossThread) {
+      FenceSSID == SyncScope::System) {
     if (Subtarget.hasMFence())
       return DAG.getNode(X86ISD::MFENCE, dl, MVT::Other, Op.getOperand(0));
 
@@ -24030,7 +24058,8 @@ SDValue X86TargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
   case ISD::MULHU:              return LowerMULH(Op, Subtarget, DAG);
   case ISD::UMUL_LOHI:
   case ISD::SMUL_LOHI:          return LowerMUL_LOHI(Op, Subtarget, DAG);
-  case ISD::ROTL:               return LowerRotate(Op, Subtarget, DAG);
+  case ISD::ROTL:
+  case ISD::ROTR:               return LowerRotate(Op, Subtarget, DAG);
   case ISD::SRA:
   case ISD::SRL:
   case ISD::SHL:                return LowerShift(Op, Subtarget, DAG);
@@ -29635,8 +29664,8 @@ static SDValue combineBasicSADPattern(SDNode *Extract, SelectionDAG &DAG,
   // (extends the sign bit which is zero).
   // So it is correct to skip the sign/zero extend instruction.
   if (Root && (Root.getOpcode() == ISD::SIGN_EXTEND ||
-	  Root.getOpcode() == ISD::ZERO_EXTEND ||
-	  Root.getOpcode() == ISD::ANY_EXTEND))
+    Root.getOpcode() == ISD::ZERO_EXTEND ||
+    Root.getOpcode() == ISD::ANY_EXTEND))
     Root = Root.getOperand(0);
 
   // If there was a match, we want Root to be a select that is the root of an
@@ -35005,6 +35034,40 @@ static SDValue combineAddOrSubToADCOrSBB(SDNode *N, SelectionDAG &DAG) {
   EVT VT = N->getValueType(0);
   X86::CondCode CC = (X86::CondCode)Y.getConstantOperandVal(0);
 
+  // If X is -1 or 0, then we have an opportunity to avoid constants required in
+  // the general case below.
+  auto *ConstantX = dyn_cast<ConstantSDNode>(X);
+  if (ConstantX) {
+    if ((!IsSub && CC == X86::COND_AE && ConstantX->isAllOnesValue()) ||
+        (IsSub && CC == X86::COND_B && ConstantX->isNullValue())) {
+      // This is a complicated way to get -1 or 0 from the carry flag:
+      // -1 + SETAE --> -1 + (!CF) --> CF ? -1 : 0 --> SBB %eax, %eax
+      //  0 - SETB  -->  0 -  (CF) --> CF ? -1 : 0 --> SBB %eax, %eax
+      return DAG.getNode(X86ISD::SETCC_CARRY, DL, VT,
+                         DAG.getConstant(X86::COND_B, DL, MVT::i8),
+                         Y.getOperand(1));
+    }
+
+    if ((!IsSub && CC == X86::COND_BE && ConstantX->isAllOnesValue()) ||
+        (IsSub && CC == X86::COND_A && ConstantX->isNullValue())) {
+      SDValue EFLAGS = Y->getOperand(1);
+      if (EFLAGS.getOpcode() == X86ISD::SUB && EFLAGS.hasOneUse() &&
+          EFLAGS.getValueType().isInteger() &&
+          !isa<ConstantSDNode>(EFLAGS.getOperand(1))) {
+        // Swap the operands of a SUB, and we have the same pattern as above.
+        // -1 + SETBE (SUB A, B) --> -1 + SETAE (SUB B, A) --> SUB + SBB
+        //  0 - SETA  (SUB A, B) -->  0 - SETB  (SUB B, A) --> SUB + SBB
+        SDValue NewSub = DAG.getNode(
+            X86ISD::SUB, SDLoc(EFLAGS), EFLAGS.getNode()->getVTList(),
+            EFLAGS.getOperand(1), EFLAGS.getOperand(0));
+        SDValue NewEFLAGS = SDValue(NewSub.getNode(), EFLAGS.getResNo());
+        return DAG.getNode(X86ISD::SETCC_CARRY, DL, VT,
+                           DAG.getConstant(X86::COND_B, DL, MVT::i8),
+                           NewEFLAGS);
+      }
+    }
+  }
+
   if (CC == X86::COND_B) {
     // X + SETB Z --> X + (mask SBB Z, Z)
     // X - SETB Z --> X - (mask SBB Z, Z)
@@ -35013,21 +35076,6 @@ static SDValue combineAddOrSubToADCOrSBB(SDNode *N, SelectionDAG &DAG) {
     if (SBB.getValueSizeInBits() != VT.getSizeInBits())
       SBB = DAG.getZExtOrTrunc(SBB, DL, VT);
     return DAG.getNode(IsSub ? ISD::SUB : ISD::ADD, DL, VT, X, SBB);
-  }
-
-  auto *ConstantX = dyn_cast<ConstantSDNode>(X);
-  if (!IsSub && ConstantX && ConstantX->isAllOnesValue()) {
-    if (CC == X86::COND_AE) {
-      // This is a complicated way to get -1 or 0 from the carry flag:
-      // -1 + SETAE --> -1 + (!CF) --> CF ? -1 : 0 --> SBB %eax, %eax
-      // We don't have to match the subtract equivalent because sub X, 1 is
-      // canonicalized to add X, -1.
-      return DAG.getNode(X86ISD::SETCC_CARRY, DL, VT,
-                         DAG.getConstant(X86::COND_B, DL, MVT::i8),
-                         Y.getOperand(1));
-    }
-
-    // TODO: Handle COND_BE if it was produced by X86ISD::SUB similar to below.
   }
 
   if (CC == X86::COND_A) {

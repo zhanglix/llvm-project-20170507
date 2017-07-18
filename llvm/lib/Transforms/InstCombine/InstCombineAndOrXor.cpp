@@ -1188,15 +1188,14 @@ static Instruction *foldBoolSextMaskToSelect(BinaryOperator &I) {
 
   // Fold (and (sext bool to A), B) --> (select bool, B, 0)
   Value *X = nullptr;
-  if (match(Op0, m_SExt(m_Value(X))) &&
-      X->getType()->getScalarType()->isIntegerTy(1)) {
+  if (match(Op0, m_SExt(m_Value(X))) && X->getType()->isIntOrIntVectorTy(1)) {
     Value *Zero = Constant::getNullValue(Op1->getType());
     return SelectInst::Create(X, Op1, Zero);
   }
 
   // Fold (and ~(sext bool to A), B) --> (select bool, 0, B)
   if (match(Op0, m_Not(m_SExt(m_Value(X)))) &&
-      X->getType()->getScalarType()->isIntegerTy(1)) {
+      X->getType()->isIntOrIntVectorTy(1)) {
     Value *Zero = Constant::getNullValue(Op0->getType());
     return SelectInst::Create(X, Zero, Op1);
   }
@@ -1285,6 +1284,16 @@ Instruction *InstCombiner::visitAnd(BinaryOperator &I) {
   if (Value *V = SimplifyBSwap(I, Builder))
     return replaceInstUsesWith(I, V);
 
+  if (match(Op1, m_One())) {
+    // (1 << x) & 1 --> zext(x == 0)
+    // (1 >> x) & 1 --> zext(x == 0)
+    Value *X;
+    if (match(Op0, m_OneUse(m_LogicalShift(m_One(), m_Value(X))))) {
+      Value *IsZero = Builder.CreateICmpEQ(X, ConstantInt::get(I.getType(), 0));
+      return new ZExtInst(IsZero, I.getType());
+    }
+  }
+
   if (ConstantInt *AndRHS = dyn_cast<ConstantInt>(Op1)) {
     const APInt &AndRHSMask = AndRHS->getValue();
 
@@ -1316,23 +1325,6 @@ Instruction *InstCombiner::visitAnd(BinaryOperator &I) {
 
         break;
       }
-      case Instruction::Sub:
-        // -x & 1 -> x & 1
-        if (AndRHSMask.isOneValue() && match(Op0LHS, m_Zero()))
-          return BinaryOperator::CreateAnd(Op0RHS, AndRHS);
-
-        break;
-
-      case Instruction::Shl:
-      case Instruction::LShr:
-        // (1 << x) & 1 --> zext(x == 0)
-        // (1 >> x) & 1 --> zext(x == 0)
-        if (AndRHSMask.isOneValue() && Op0LHS == AndRHS) {
-          Value *NewICmp =
-            Builder.CreateICmpEQ(Op0RHS, Constant::getNullValue(I.getType()));
-          return new ZExtInst(NewICmp, I.getType());
-        }
-        break;
       }
 
       // ((C1 OP zext(X)) & C2) -> zext((C1-X) & C2) if C2 fits in the bitwidth
@@ -1417,12 +1409,6 @@ Instruction *InstCombiner::visitAnd(BinaryOperator &I) {
           return BinaryOperator::CreateAnd(A, Builder.CreateNot(B));
       }
     }
-
-    // (A&((~A)|B)) -> A&B
-    if (match(Op0, m_c_Or(m_Not(m_Specific(Op1)), m_Value(A))))
-      return BinaryOperator::CreateAnd(A, Op1);
-    if (match(Op1, m_c_Or(m_Not(m_Specific(Op0)), m_Value(A))))
-      return BinaryOperator::CreateAnd(A, Op0);
 
     // (A ^ B) & ((B ^ C) ^ A) -> (A ^ B) & ~C
     if (match(Op0, m_Xor(m_Value(A), m_Value(B))))
@@ -1559,14 +1545,14 @@ static Value *getSelectCondition(Value *A, Value *B,
                                  InstCombiner::BuilderTy &Builder) {
   // If these are scalars or vectors of i1, A can be used directly.
   Type *Ty = A->getType();
-  if (match(A, m_Not(m_Specific(B))) && Ty->getScalarType()->isIntegerTy(1))
+  if (match(A, m_Not(m_Specific(B))) && Ty->isIntOrIntVectorTy(1))
     return A;
 
   // If A and B are sign-extended, look through the sexts to find the booleans.
   Value *Cond;
   Value *NotB;
   if (match(A, m_SExt(m_Value(Cond))) &&
-      Cond->getType()->getScalarType()->isIntegerTy(1) &&
+      Cond->getType()->isIntOrIntVectorTy(1) &&
       match(B, m_OneUse(m_Not(m_Value(NotB))))) {
     NotB = peekThroughBitcast(NotB, true);
     if (match(NotB, m_SExt(m_Specific(Cond))))
@@ -1588,7 +1574,7 @@ static Value *getSelectCondition(Value *A, Value *B,
   // operand, see if the constants are inverse bitmasks.
   if (match(A, (m_Xor(m_SExt(m_Value(Cond)), m_Constant(AC)))) &&
       match(B, (m_Xor(m_SExt(m_Specific(Cond)), m_Constant(BC)))) &&
-      Cond->getType()->getScalarType()->isIntegerTy(1) &&
+      Cond->getType()->isIntOrIntVectorTy(1) &&
       areInverseVectorBitmasks(AC, BC)) {
     AC = ConstantExpr::getTrunc(AC, CmpInst::makeCmpResultType(Ty));
     return Builder.CreateXor(Cond, AC);
@@ -2021,18 +2007,6 @@ Instruction *InstCombiner::visitOr(BinaryOperator &I) {
 
   Value *A, *B;
 
-  // ((~A & B) | A) -> (A | B)
-  if (match(Op0, m_c_And(m_Not(m_Specific(Op1)), m_Value(A))))
-    return BinaryOperator::CreateOr(A, Op1);
-  if (match(Op1, m_c_And(m_Not(m_Specific(Op0)), m_Value(A))))
-    return BinaryOperator::CreateOr(Op0, A);
-
-  // ((A & B) | ~A) -> (~A | B)
-  // The NOT is guaranteed to be in the RHS by complexity ordering.
-  if (match(Op1, m_Not(m_Value(A))) &&
-      match(Op0, m_c_And(m_Specific(A), m_Value(B))))
-    return BinaryOperator::CreateOr(Op1, B);
-
   // (A & C)|(B & D)
   Value *C = nullptr, *D = nullptr;
   if (match(Op0, m_And(m_Value(A), m_Value(C))) &&
@@ -2177,17 +2151,6 @@ Instruction *InstCombiner::visitOr(BinaryOperator &I) {
         return BinaryOperator::CreateOr(Not, Op0);
       }
 
-  // (A & B) | (~A ^ B) -> (~A ^ B)
-  // (A & B) | (B ^ ~A) -> (~A ^ B)
-  // (B & A) | (~A ^ B) -> (~A ^ B)
-  // (B & A) | (B ^ ~A) -> (~A ^ B)
-  // The match order is important: match the xor first because the 'not'
-  // operation defines 'A'. We do not need to match the xor as Op0 because the
-  // xor was canonicalized to Op1 above.
-  if (match(Op1, m_c_Xor(m_Not(m_Value(A)), m_Value(B))) &&
-      match(Op0, m_c_And(m_Specific(A), m_Specific(B))))
-    return BinaryOperator::CreateXor(Builder.CreateNot(A), B);
-
   if (SwappedForXor)
     std::swap(Op0, Op1);
 
@@ -2230,10 +2193,10 @@ Instruction *InstCombiner::visitOr(BinaryOperator &I) {
 
   // or(sext(A), B) / or(B, sext(A)) --> A ? -1 : B, where A is i1 or <N x i1>.
   if (match(Op0, m_OneUse(m_SExt(m_Value(A)))) &&
-      A->getType()->getScalarType()->isIntegerTy(1))
+      A->getType()->isIntOrIntVectorTy(1))
     return SelectInst::Create(A, ConstantInt::getSigned(I.getType(), -1), Op1);
   if (match(Op1, m_OneUse(m_SExt(m_Value(A)))) &&
-      A->getType()->getScalarType()->isIntegerTy(1))
+      A->getType()->isIntOrIntVectorTy(1))
     return SelectInst::Create(A, ConstantInt::getSigned(I.getType(), -1), Op0);
 
   // Note: If we've gotten to the point of visiting the outer OR, then the

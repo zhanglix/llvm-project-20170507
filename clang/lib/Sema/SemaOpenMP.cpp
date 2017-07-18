@@ -1807,6 +1807,8 @@ void Sema::ActOnOpenMPRegionStart(OpenMPDirectiveKind DKind, Scope *CurScope) {
         std::make_pair(".lb.", KmpUInt64Ty),
         std::make_pair(".ub.", KmpUInt64Ty), std::make_pair(".st.", KmpInt64Ty),
         std::make_pair(".liter.", KmpInt32Ty),
+        std::make_pair(".reductions.",
+                       Context.VoidPtrTy.withConst().withRestrict()),
         std::make_pair(StringRef(), QualType()) // __context with shared vars
     };
     ActOnCapturedRegionStart(DSAStack->getConstructLoc(), CurScope, CR_OpenMP,
@@ -6106,6 +6108,33 @@ static bool checkGrainsizeNumTasksClauses(Sema &S,
   return ErrorFound;
 }
 
+static bool checkReductionClauseWithNogroup(Sema &S,
+                                            ArrayRef<OMPClause *> Clauses) {
+  OMPClause *ReductionClause = nullptr;
+  OMPClause *NogroupClause = nullptr;
+  for (auto *C : Clauses) {
+    if (C->getClauseKind() == OMPC_reduction) {
+      ReductionClause = C;
+      if (NogroupClause)
+        break;
+      continue;
+    }
+    if (C->getClauseKind() == OMPC_nogroup) {
+      NogroupClause = C;
+      if (ReductionClause)
+        break;
+      continue;
+    }
+  }
+  if (ReductionClause && NogroupClause) {
+    S.Diag(ReductionClause->getLocStart(), diag::err_omp_reduction_with_nogroup)
+        << SourceRange(NogroupClause->getLocStart(),
+                       NogroupClause->getLocEnd());
+    return true;
+  }
+  return false;
+}
+
 StmtResult Sema::ActOnOpenMPTaskLoopDirective(
     ArrayRef<OMPClause *> Clauses, Stmt *AStmt, SourceLocation StartLoc,
     SourceLocation EndLoc,
@@ -6131,6 +6160,11 @@ StmtResult Sema::ActOnOpenMPTaskLoopDirective(
   // The grainsize clause and num_tasks clause are mutually exclusive and may
   // not appear on the same taskloop directive.
   if (checkGrainsizeNumTasksClauses(*this, Clauses))
+    return StmtError();
+  // OpenMP, [2.9.2 taskloop Construct, Restrictions]
+  // If a reduction clause is present on the taskloop directive, the nogroup
+  // clause must not be specified.
+  if (checkReductionClauseWithNogroup(*this, Clauses))
     return StmtError();
 
   getCurFunction()->setHasBranchProtectedScope();
@@ -6174,6 +6208,11 @@ StmtResult Sema::ActOnOpenMPTaskLoopSimdDirective(
   // The grainsize clause and num_tasks clause are mutually exclusive and may
   // not appear on the same taskloop directive.
   if (checkGrainsizeNumTasksClauses(*this, Clauses))
+    return StmtError();
+  // OpenMP, [2.9.2 taskloop Construct, Restrictions]
+  // If a reduction clause is present on the taskloop directive, the nogroup
+  // clause must not be specified.
+  if (checkReductionClauseWithNogroup(*this, Clauses))
     return StmtError();
 
   getCurFunction()->setHasBranchProtectedScope();
@@ -9399,6 +9438,12 @@ OMPClause *Sema::ActOnOpenMPReductionClause(
                          SimpleRefExpr, RefRes.get());
           if (!PostUpdateRes.isUsable())
             continue;
+          if (isOpenMPTaskingDirective(DSAStack->getCurrentDirective())) {
+            Diag(RefExpr->getExprLoc(),
+                 diag::err_omp_reduction_non_addressable_expression)
+                << RefExpr->getSourceRange();
+            continue;
+          }
           ExprPostUpdates.push_back(
               IgnoredValueConversions(PostUpdateRes.get()).get());
         }

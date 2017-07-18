@@ -31,13 +31,54 @@ struct ProcSelfMapsBuff {
 void ReadProcMaps(ProcSelfMapsBuff *proc_maps);
 #endif  // SANITIZER_FREEBSD || SANITIZER_LINUX
 
+// Memory protection masks.
+static const uptr kProtectionRead = 1;
+static const uptr kProtectionWrite = 2;
+static const uptr kProtectionExecute = 4;
+static const uptr kProtectionShared = 8;
+
+class MemoryMappedSegment {
+ public:
+  MemoryMappedSegment(char *buff = nullptr, uptr size = 0)
+      : filename(buff), filename_size(size) {}
+  ~MemoryMappedSegment() {}
+
+  bool IsReadable() { return protection & kProtectionRead; }
+  bool IsWritable() { return protection & kProtectionWrite; }
+  bool IsExecutable() { return protection & kProtectionExecute; }
+  bool IsShared() { return protection & kProtectionShared; }
+
+  uptr start;
+  uptr end;
+  uptr offset;
+  char *filename;  // owned by caller
+  uptr filename_size;
+  uptr protection;
+  ModuleArch arch;
+  u8 uuid[kModuleUUIDSize];
+
+#if SANITIZER_MAC
+  char name[kMaxSegName];
+
+ private:
+  friend class MemoryMappingLayout;
+
+  template <typename Section>
+  void NextSectionLoad(LoadedModule *module);
+  void AddAddressRanges(LoadedModule *module);
+
+  uptr nsects_;
+  char *current_load_cmd_addr_;
+  u32 lc_type_;
+  uptr base_virt_addr_;
+#endif
+};
+
 class MemoryMappingLayout {
  public:
   explicit MemoryMappingLayout(bool cache_enabled);
   ~MemoryMappingLayout();
-  bool Next(uptr *start, uptr *end, uptr *offset, char filename[],
-            uptr filename_size, uptr *protection, ModuleArch *arch = nullptr,
-            u8 *uuid = nullptr);
+  bool Next(MemoryMappedSegment *segment);
   void Reset();
   // In some cases, e.g. when running under a sandbox on Linux, ASan is unable
   // to obtain the memory mappings. It should fall back to pre-cached data
@@ -46,12 +87,6 @@ class MemoryMappingLayout {
 
   // Adds all mapped objects into a vector.
   void DumpListOfModules(InternalMmapVector<LoadedModule> *modules);
-
-  // Memory protection masks.
-  static const uptr kProtectionRead = 1;
-  static const uptr kProtectionWrite = 2;
-  static const uptr kProtectionExecute = 4;
-  static const uptr kProtectionShared = 8;
 
  private:
   void LoadFromCache();
@@ -67,10 +102,7 @@ class MemoryMappingLayout {
   static StaticSpinMutex cache_lock_;  // protects cached_proc_self_maps_.
 # elif SANITIZER_MAC
   template <u32 kLCSegment, typename SegmentCommand>
-  bool NextSegmentLoad(uptr *start, uptr *end, uptr *offset, char filename[],
-                       uptr filename_size, ModuleArch *arch, u8 *uuid,
-                       uptr *protection);
-  void GetSegmentAddrRange(uptr *start, uptr *end, uptr vmaddr, uptr vmsize);
+  bool NextSegmentLoad(MemoryMappedSegment *segment);
   int current_image_;
   u32 current_magic_;
   u32 current_filetype_;

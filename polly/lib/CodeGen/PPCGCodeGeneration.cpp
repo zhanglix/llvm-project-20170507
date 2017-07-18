@@ -686,8 +686,8 @@ private:
 };
 
 std::string GPUNodeBuilder::getKernelFuncName(int Kernel_id) {
-  return "FUNC_" + S.getFunction().getName().str() + "_KERNEL_" +
-         std::to_string(Kernel_id);
+  return "FUNC_" + S.getFunction().getName().str() + "_SCOP_" +
+         std::to_string(S.getID()) + "_KERNEL_" + std::to_string(Kernel_id);
 }
 
 void GPUNodeBuilder::initializeAfterRTH() {
@@ -1358,7 +1358,16 @@ GPUNodeBuilder::getReferencesInKernel(ppcg_kernel *Kernel) {
   SetVector<Function *> ValidSubtreeFunctions(
       getFunctionsFromRawSubtreeValues(SubtreeValues));
 
-  return std::make_pair(ValidSubtreeValues, ValidSubtreeFunctions);
+  // @see IslNodeBuilder::getReferencesInSubtree
+  SetVector<Value *> ReplacedValues;
+  for (Value *V : ValidSubtreeValues) {
+    auto It = ValueMap.find(V);
+    if (It == ValueMap.end())
+      ReplacedValues.insert(V);
+    else
+      ReplacedValues.insert(It->second);
+  }
+  return std::make_pair(ReplacedValues, ValidSubtreeFunctions);
 }
 
 void GPUNodeBuilder::clearDominators(Function *F) {
@@ -1524,6 +1533,8 @@ GPUNodeBuilder::createLaunchParameters(ppcg_kernel *Kernel, Function *F,
   for (long i = 0; i < NumVars; i++) {
     isl_id *Id = isl_space_get_dim_id(Kernel->space, isl_dim_param, i);
     Value *Val = IDToValue[Id];
+    if (ValueMap.count(Val))
+      Val = ValueMap[Val];
     isl_id_free(Id);
 
     ArgSizes[Index] = computeSizeInBytes(Val->getType());
@@ -2924,9 +2935,13 @@ public:
     // the SCEVExpander may introduce while code generating the parameters and
     // which may introduce scalar dependences that prevent us from correctly
     // code generating this scop.
-    BBPair StartExitBlocks =
+    BBPair StartExitBlocks;
+    BranchInst *CondBr = nullptr;
+    std::tie(StartExitBlocks, CondBr) =
         executeScopConditionally(*S, Builder.getTrue(), *DT, *RI, *LI);
     BasicBlock *StartBlock = std::get<0>(StartExitBlocks);
+
+    assert(CondBr && "CondBr not initialized by executeScopConditionally");
 
     GPUNodeBuilder NodeBuilder(Builder, Annotator, *DL, *LI, *SE, *DT, *S,
                                StartBlock, Prog, Runtime, Architecture);
@@ -2948,6 +2963,7 @@ public:
     Builder.SetInsertPoint(&*StartBlock->begin());
 
     NodeBuilder.initializeAfterRTH();
+    NodeBuilder.preloadInvariantLoads();
     NodeBuilder.create(Root);
     NodeBuilder.finalize();
 
@@ -2955,10 +2971,10 @@ public:
     /// kernel, the SCoP is probably mostly sequential. Hence, there is no
     /// point in running it on a GPU.
     if (NodeBuilder.DeepestSequential > NodeBuilder.DeepestParallel)
-      SplitBlock->getTerminator()->setOperand(0, Builder.getFalse());
+      CondBr->setOperand(0, Builder.getFalse());
 
     if (!NodeBuilder.BuildSuccessful)
-      SplitBlock->getTerminator()->setOperand(0, Builder.getFalse());
+      CondBr->setOperand(0, Builder.getFalse());
   }
 
   bool runOnScop(Scop &CurrentScop) override {

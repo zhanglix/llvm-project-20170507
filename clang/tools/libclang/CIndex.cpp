@@ -7807,6 +7807,15 @@ unsigned clang_CXXMethod_isVirtual(CXCursor C) {
   return (Method && Method->isVirtual()) ? 1 : 0;
 }
 
+unsigned clang_EnumDecl_isScoped(CXCursor C) {
+  if (!clang_isDeclaration(C.kind))
+    return 0;
+
+  const Decl *D = cxcursor::getCursorDecl(C);
+  auto *Enum = dyn_cast_or_null<EnumDecl>(D);
+  return (Enum && Enum->isScoped()) ? 1 : 0;
+}
+
 //===----------------------------------------------------------------------===//
 // Attribute introspection.
 //===----------------------------------------------------------------------===//
@@ -8186,7 +8195,7 @@ cxindex::checkForMacroInMacroDefinition(const MacroInfo *MI, const Token &Tok,
     return nullptr;
 
   // Check that the identifier is not one of the macro arguments.
-  if (std::find(MI->arg_begin(), MI->arg_end(), &II) != MI->arg_end())
+  if (std::find(MI->param_begin(), MI->param_end(), &II) != MI->param_end())
     return nullptr;
 
   MacroDirective *InnerMD = PP.getLocalMacroDirectiveHistory(&II);
